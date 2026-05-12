@@ -737,10 +737,21 @@ final class ComicTranslator: ObservableObject {
             return stats
         }
 
-        await progressReporter.report(stage: .translating, index: index, fileName: relativePath, message: "翻译 \(validOCR.count) 块")
+        let textBlocks = validOCR.map { TextBlock(from: $0) }
+        let regions = RegionSegmenter().segment(blocks: textBlocks)
+        let textMerger = TextMerger()
+        let mergedBlocks = regions.flatMap { textMerger.merge(blocks: $0.blocks) }
+
+        if mergedBlocks.isEmpty {
+            Self.safeCopy(from: inputURL, to: outputURL)
+            stats.skipped += 1
+            return stats
+        }
+
+        await progressReporter.report(stage: .translating, index: index, fileName: relativePath, message: "翻译 \(mergedBlocks.count) 段")
 
         stepStart = CFAbsoluteTimeGetCurrent()
-        let texts = validOCR.map(\.text)
+        let texts = mergedBlocks.map(\.text)
         let translations = await translateTextsBatch(
             texts: texts,
             from: config.sourceLang,
@@ -760,7 +771,7 @@ final class ComicTranslator: ObservableObject {
         let renderSuccess: Bool = await Task.detached(priority: .userInitiated) {
             guard let rendered = ImageRenderer.renderTranslated(
                 original: cgImage,
-                ocrResults: validOCR,
+                textBlocks: mergedBlocks,
                 translations: translations
             ) else { return false }
 

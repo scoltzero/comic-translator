@@ -434,8 +434,12 @@ final class ComicTranslator: ObservableObject {
             message: "渲染 PDF 页面"
         ))
 
-        let pages = try await Task.detached(priority: .userInitiated) { [inputURL, pageDir] in
-            try PDFHandler.renderPages(from: inputURL, to: pageDir)
+        let pdfRenderConcurrency = max(1, settings.taskConcurrency)
+        if pdfRenderConcurrency > 1 {
+            addLog(.info, "   ⚙️ PDF 拆页并发: \(pdfRenderConcurrency)")
+        }
+        let pages = try await Task.detached(priority: .userInitiated) { [inputURL, pageDir, pdfRenderConcurrency] in
+            try await PDFHandler.renderPages(from: inputURL, to: pageDir, concurrency: pdfRenderConcurrency)
         }.value
         addLog(.info, "   📄 PDF 渲染完成：\(pages.count) 页 [\(formatElapsed(CFAbsoluteTimeGetCurrent() - stepStart))]")
 

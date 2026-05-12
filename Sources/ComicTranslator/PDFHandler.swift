@@ -10,11 +10,15 @@ struct PDFPageInfo: Sendable {
 }
 
 enum PDFHandler {
-    static func renderPages(from pdfURL: URL, to directory: URL, scale: CGFloat = 2.0) throws -> [PDFPageInfo] {
+    static func renderPages(
+        from pdfURL: URL,
+        to directory: URL,
+        scale: CGFloat = 2.0,
+        concurrency: Int = 1
+    ) async throws -> [PDFPageInfo] {
         guard let document = PDFDocument(url: pdfURL) else {
             throw PDFHandlerError.cannotOpenPDF
         }
-
         let pageCount = document.pageCount
         guard pageCount > 0 else {
             throw PDFHandlerError.emptyPDF
@@ -22,52 +26,79 @@ enum PDFHandler {
 
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
 
-        var pages: [PDFPageInfo] = []
-        pages.reserveCapacity(pageCount)
+        let semaphore = AsyncSemaphore(value: max(1, min(concurrency, pageCount)))
+        var indexedPages: [(Int, PDFPageInfo)] = []
+        indexedPages.reserveCapacity(pageCount)
 
-        for index in 0..<pageCount {
-            guard let page = document.page(at: index) else { continue }
-
-            let bounds = page.bounds(for: .mediaBox)
-            let pageSize = bounds.size
-            let pixelWidth = max(1, Int((pageSize.width * scale).rounded(.up)))
-            let pixelHeight = max(1, Int((pageSize.height * scale).rounded(.up)))
-
-            guard let context = CGContext(
-                data: nil,
-                width: pixelWidth,
-                height: pixelHeight,
-                bitsPerComponent: 8,
-                bytesPerRow: pixelWidth * 4,
-                space: CGColorSpaceCreateDeviceRGB(),
-                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-            ) else {
-                throw PDFHandlerError.cannotRenderPage(index + 1)
+        try await withThrowingTaskGroup(of: (Int, PDFPageInfo).self) { group in
+            for index in 0..<pageCount {
+                group.addTask { [pdfURL, directory, scale, semaphore] in
+                    await semaphore.wait()
+                    do {
+                        let pageInfo = try renderPage(index: index, from: pdfURL, to: directory, scale: scale)
+                        await semaphore.signal()
+                        return (index, pageInfo)
+                    } catch {
+                        await semaphore.signal()
+                        throw error
+                    }
+                }
             }
 
-            context.setFillColor(NSColor.white.cgColor)
-            context.fill(CGRect(x: 0, y: 0, width: pixelWidth, height: pixelHeight))
-            context.saveGState()
-            context.scaleBy(x: scale, y: scale)
-            context.translateBy(x: -bounds.origin.x, y: -bounds.origin.y)
-            page.draw(with: .mediaBox, to: context)
-            context.restoreGState()
-
-            guard let image = context.makeImage() else {
-                throw PDFHandlerError.cannotRenderPage(index + 1)
+            for try await page in group {
+                indexedPages.append(page)
             }
-
-            let fileName = String(format: "page-%04d.png", index + 1)
-            let outputURL = directory.appendingPathComponent(fileName)
-            try ImageRenderer.saveImage(image, to: outputURL, format: .png)
-            pages.append(PDFPageInfo(relativePath: fileName, pageSize: pageSize))
         }
 
-        guard !pages.isEmpty else {
+        let pages = indexedPages
+            .sorted { $0.0 < $1.0 }
+            .map(\.1)
+
+        guard pages.count == pageCount else {
             throw PDFHandlerError.emptyPDF
         }
-
         return pages
+    }
+
+    private static func renderPage(index: Int, from pdfURL: URL, to directory: URL, scale: CGFloat) throws -> PDFPageInfo {
+        guard let document = PDFDocument(url: pdfURL),
+              let page = document.page(at: index) else {
+            throw PDFHandlerError.cannotRenderPage(index + 1)
+        }
+
+        let bounds = page.bounds(for: .mediaBox)
+        let pageSize = bounds.size
+        let pixelWidth = max(1, Int((pageSize.width * scale).rounded(.up)))
+        let pixelHeight = max(1, Int((pageSize.height * scale).rounded(.up)))
+
+        guard let context = CGContext(
+            data: nil,
+            width: pixelWidth,
+            height: pixelHeight,
+            bitsPerComponent: 8,
+            bytesPerRow: pixelWidth * 4,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            throw PDFHandlerError.cannotRenderPage(index + 1)
+        }
+
+        context.setFillColor(NSColor.white.cgColor)
+        context.fill(CGRect(x: 0, y: 0, width: pixelWidth, height: pixelHeight))
+        context.saveGState()
+        context.scaleBy(x: scale, y: scale)
+        context.translateBy(x: -bounds.origin.x, y: -bounds.origin.y)
+        page.draw(with: .mediaBox, to: context)
+        context.restoreGState()
+
+        guard let image = context.makeImage() else {
+            throw PDFHandlerError.cannotRenderPage(index + 1)
+        }
+
+        let fileName = String(format: "page-%04d.png", index + 1)
+        let outputURL = directory.appendingPathComponent(fileName)
+        try ImageRenderer.saveImage(image, to: outputURL, format: .png)
+        return PDFPageInfo(relativePath: fileName, pageSize: pageSize)
     }
 
     static func createPDF(from pages: [PDFPageInfo], imageDirectory: URL, to outputURL: URL) throws {

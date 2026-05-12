@@ -96,7 +96,16 @@ final class AppSettings: ObservableObject {
     }
 
     @Published var customPromptTemplate: String {
-        didSet { UserDefaults.standard.set(customPromptTemplate, forKey: "customPromptTemplate") }
+        didSet {
+            if customPromptTemplate.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                UserDefaults.standard.removeObject(forKey: "customPromptTemplate")
+                if !customPromptTemplate.isEmpty {
+                    customPromptTemplate = ""
+                }
+            } else {
+                UserDefaults.standard.set(customPromptTemplate, forKey: "customPromptTemplate")
+            }
+        }
     }
 
     @Published var domain: TranslationDomain {

@@ -104,8 +104,9 @@ struct OllamaAPI: TranslationAPI {
     }
 
     private func buildPrompt(text: String, source: String, target: String) -> String {
-        if !config.customPromptTemplate.isEmpty {
-            return applyTemplate(config.customPromptTemplate, text: text, source: source, target: target, domain: config.domainInstruction)
+        let customPromptTemplate = config.customPromptTemplate.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !customPromptTemplate.isEmpty {
+            return applyTemplate(customPromptTemplate, text: text, source: source, target: target, domain: config.domainInstruction)
         }
         let targetName = LanguageOption.named(target)?.name ?? target
         var parts: [String] = []
@@ -174,8 +175,9 @@ struct HYMTAPI: TranslationAPI {
     }
 
     private func buildPrompt(text: String, source: String, target: String) -> String {
-        if !config.customPromptTemplate.isEmpty {
-            return applyTemplate(config.customPromptTemplate, text: text, source: source, target: target, domain: config.domainInstruction)
+        let customPromptTemplate = config.customPromptTemplate.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !customPromptTemplate.isEmpty {
+            return applyTemplate(customPromptTemplate, text: text, source: source, target: target, domain: config.domainInstruction)
         }
         // HY-MT 官方 prompt 模板 + 领域指令
         let isZhInvolved = source.hasPrefix("zh") || target.hasPrefix("zh")
@@ -294,8 +296,9 @@ struct OpenAICompatibleAPI: TranslationAPI {
     }
 
     private func buildPrompt(text: String, source: String, target: String) -> String {
-        if !config.customPromptTemplate.isEmpty {
-            return applyTemplate(config.customPromptTemplate, text: text, source: source, target: target, domain: config.domainInstruction)
+        let customPromptTemplate = config.customPromptTemplate.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !customPromptTemplate.isEmpty {
+            return applyTemplate(customPromptTemplate, text: text, source: source, target: target, domain: config.domainInstruction)
         }
         let targetName = LanguageOption.named(target)?.name ?? target
         let sourceName = LanguageOption.named(source)?.name ?? source
@@ -330,8 +333,9 @@ private func postJSON(to urlString: String, body: [String: Any], apiKey: String 
     return data
 }
 
-private func cleanResponse(_ content: String) -> String {
+func cleanResponse(_ content: String) -> String {
     var result = content.trimmingCharacters(in: .whitespacesAndNewlines)
+    result = removeThinkBlocks(from: result)
 
     // 移除 <target></target>、<translation></translation> 标签
     for tag in ["target", "translation", "output"] {
@@ -351,6 +355,7 @@ private func cleanResponse(_ content: String) -> String {
             if !inner.isEmpty { result = inner }
         }
     }
+    result = removeThinkBlocks(from: result)
 
     // 移除成对包裹的引号
     let quotePairs: [(String, String)] = [("\"", "\""), ("「", "」"), ("“", "”"), ("『", "』")]
@@ -363,10 +368,20 @@ private func cleanResponse(_ content: String) -> String {
     return result.trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
+private func removeThinkBlocks(from content: String) -> String {
+    let pattern = #"<think\b[^>]*>[\s\S]*?</think>"#
+    let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive])
+    let range = NSRange(content.startIndex..<content.endIndex, in: content)
+    return regex?
+        .stringByReplacingMatches(in: content, options: [], range: range, withTemplate: "")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        ?? content.trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
 private func applyTemplate(_ template: String, text: String, source: String, target: String, domain: String = "") -> String {
     let targetName = LanguageOption.named(target)?.name ?? target
     let sourceName = LanguageOption.named(source)?.name ?? source
-    return template
+    return template.trimmingCharacters(in: .whitespacesAndNewlines)
         .replacingOccurrences(of: "{text}", with: text)
         .replacingOccurrences(of: "{source}", with: sourceName)
         .replacingOccurrences(of: "{target}", with: targetName)

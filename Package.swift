@@ -14,6 +14,11 @@ let package = Package(
             name: "ComicTranslator",
             path: "Sources/ComicTranslator",
             resources: []
+        ),
+        .testTarget(
+            name: "ComicTranslatorTests",
+            dependencies: ["ComicTranslator"],
+            path: "Tests/ComicTranslatorTests"
         )
     ]
 )

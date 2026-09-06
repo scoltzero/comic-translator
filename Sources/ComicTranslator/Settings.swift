@@ -79,10 +79,6 @@ final class AppSettings: ObservableObject {
         didSet { UserDefaults.standard.set(targetLang, forKey: "targetLang") }
     }
 
-    @Published var concurrency: Int {
-        didSet { UserDefaults.standard.set(concurrency, forKey: "concurrency") }
-    }
-
     @Published var taskConcurrency: Int {
         didSet { UserDefaults.standard.set(taskConcurrency, forKey: "taskConcurrency") }
     }
@@ -124,6 +120,19 @@ final class AppSettings: ObservableObject {
         didSet { UserDefaults.standard.set(subtitleBilingual, forKey: "subtitleBilingual") }
     }
 
+    // MARK: 跨页分批批量翻译
+    @Published var batchTranslationEnabled: Bool {
+        didSet { UserDefaults.standard.set(batchTranslationEnabled, forKey: "batchTranslationEnabled") }
+    }
+
+    @Published var batchPagesLimit: Int {
+        didSet { UserDefaults.standard.set(batchPagesLimit, forKey: "batchPagesLimit") }
+    }
+
+    @Published var batchConcurrency: Int {
+        didSet { UserDefaults.standard.set(batchConcurrency, forKey: "batchConcurrency") }
+    }
+
     init() {
         let d = UserDefaults.standard
         self.apiEndpoint = d.string(forKey: "apiEndpoint") ?? "http://localhost:11434"
@@ -133,15 +142,8 @@ final class AppSettings: ObservableObject {
         self.apiFormat = APIFormat(rawValue: fmt) ?? .ollama
         self.sourceLang = d.string(forKey: "sourceLang") ?? "it"
         self.targetLang = d.string(forKey: "targetLang") ?? "zh-Hans"
-        let c = d.integer(forKey: "concurrency")
-        let normalizedConcurrency = c < 1 ? 4 : c
-        self.concurrency = normalizedConcurrency
         let tc = d.integer(forKey: "taskConcurrency")
-        let normalizedTaskConcurrency = tc < 1 ? 1 : tc
-        self.taskConcurrency = normalizedTaskConcurrency <= normalizedConcurrency
-            && normalizedConcurrency % normalizedTaskConcurrency == 0
-            ? normalizedTaskConcurrency
-            : 1
+        self.taskConcurrency = tc < 1 ? 1 : min(tc, 16)
         let t = d.double(forKey: "temperature")
         self.temperature = t == 0 ? 0.7 : t
         let out = d.string(forKey: "outputFormat") ?? OutputFormat.sameAsInput.rawValue
@@ -154,6 +156,16 @@ final class AppSettings: ObservableObject {
         let sub = d.string(forKey: "subtitleFormat") ?? SubtitleFormat.srt.rawValue
         self.subtitleFormat = SubtitleFormat(rawValue: sub) ?? .srt
         self.subtitleBilingual = d.object(forKey: "subtitleBilingual") == nil ? true : d.bool(forKey: "subtitleBilingual")
+
+        // 跨页批量翻译现在是图片翻译的固定流程；保留字段仅用于兼容旧数据结构。
+        self.batchTranslationEnabled = true
+        let bpl = d.integer(forKey: "batchPagesLimit")
+        self.batchPagesLimit = (1...8).contains(bpl) ? bpl : 8
+        // 兼容旧版本的“并发数”：如果新设置不存在，就把旧值迁移为翻译并发。
+        let bc = d.object(forKey: "batchConcurrency") == nil
+            ? d.integer(forKey: "concurrency")
+            : d.integer(forKey: "batchConcurrency")
+        self.batchConcurrency = bc < 1 ? 1 : min(bc, 16)
     }
 }
 

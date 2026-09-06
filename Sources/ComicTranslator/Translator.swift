@@ -144,10 +144,9 @@ final class ComicTranslator: ObservableObject {
     }
 
     func cancel() {
-        currentTask?.cancel()
-        currentTask = nil
-        isProcessing = false
-        addLog(.warning, "⚠️ 已取消")
+        guard let currentTask else { return }
+        currentTask.cancel()
+        addLog(.warning, "⏹️ 正在取消，等待已启动的任务停止…")
     }
 
     // MARK: - 批量翻译
@@ -169,8 +168,13 @@ final class ComicTranslator: ObservableObject {
 
         currentTask = Task { @MainActor in
             defer {
+                let wasCancelled = Task.isCancelled
                 self.isProcessing = false
-                self.batchCompleted = true
+                self.batchCompleted = !wasCancelled
+                self.currentTask = nil
+                if wasCancelled {
+                    self.addLog(.warning, "⏹️ 取消完成，所有批次已停止")
+                }
             }
 
             let total = self.fileTasks.count
@@ -353,7 +357,7 @@ final class ComicTranslator: ObservableObject {
             to: settings.targetLang,
             api: api,
             cache: cache,
-            concurrency: settings.concurrency,
+            concurrency: settings.batchConcurrency,
             domainKey: settings.domain.rawValue
         )
         let translateTime = CFAbsoluteTimeGetCurrent() - translateStart
@@ -579,6 +583,9 @@ final class ComicTranslator: ObservableObject {
         var ocrTime: Double = 0
         var translateTime: Double = 0
         var renderTime: Double = 0
+        var batchRequestCount = 0
+        var fallbackCount = 0
+        var untranslatedBlocks = 0
 
         mutating func merge(_ other: ProcessingStats) {
             translated += other.translated
@@ -587,6 +594,9 @@ final class ComicTranslator: ObservableObject {
             ocrTime += other.ocrTime
             translateTime += other.translateTime
             renderTime += other.renderTime
+            batchRequestCount += other.batchRequestCount
+            fallbackCount += other.fallbackCount
+            untranslatedBlocks += other.untranslatedBlocks
         }
     }
 
@@ -634,9 +644,21 @@ final class ComicTranslator: ObservableObject {
     ) async throws -> ProcessingStats {
         var stats = ProcessingStats()
 
+        if settings.batchTranslationEnabled {
+            return try await processImagesBatched(
+                imageFiles: imageFiles,
+                extractDir: extractDir,
+                outputDir: outputDir,
+                ocrLangs: ocrLangs,
+                settings: settings,
+                api: api,
+                progressUpdate: progressUpdate
+            )
+        }
+
         let requestedImageConcurrency = max(1, settings.taskConcurrency)
         let imageConcurrency = min(requestedImageConcurrency, max(1, imageFiles.count))
-        let apiConcurrencyPerImage = max(1, settings.concurrency / max(1, imageConcurrency))
+        let apiConcurrencyPerImage = max(1, settings.batchConcurrency / max(1, imageConcurrency))
         let config = ImageProcessingConfig(
             sourceLang: settings.sourceLang,
             targetLang: settings.targetLang,
@@ -646,7 +668,7 @@ final class ComicTranslator: ObservableObject {
         )
 
         if config.imageConcurrency > 1 {
-            addLog(.info, "   ⚙️ 页面并发: \(config.imageConcurrency) | 每页 API 并发: \(config.apiConcurrencyPerImage)")
+            addLog(.info, "   ⚙️ 页面处理并发: \(config.imageConcurrency) | 翻译并发: \(settings.batchConcurrency)（按页分配）")
         }
 
         let imageSemaphore = AsyncSemaphore(value: config.imageConcurrency)
@@ -796,6 +818,732 @@ final class ComicTranslator: ObservableObject {
             stats.failed += 1
         }
 
+        return stats
+    }
+
+    // MARK: - 跨页批量翻译（settings.batchTranslationEnabled == true）
+
+    private struct BatchProcessingConfig: Sendable {
+        let sourceLang: String
+        let targetLang: String
+        let domainKey: String
+        let batchConcurrency: Int
+        let maxPagesPerBatch: Int
+    }
+
+    typealias BatchLogHandler = @Sendable (LogEntry.Level, String) -> Void
+
+    private actor BatchExecutionTracker {
+        private var active = 0
+
+        func begin() -> Int {
+            active += 1
+            return active
+        }
+
+        func end() -> Int {
+            active = max(0, active - 1)
+            return active
+        }
+    }
+
+    private struct PreparedPage: Sendable {
+        let pageIndex: Int
+        let relativePath: String
+        let image: SendableImage
+        let mergedBlocks: [MergedTextBlock]
+    }
+
+    private struct PrepareResult: Sendable {
+        let page: PreparedPage?
+        let stats: ProcessingStats
+    }
+
+    /// 供纯 helper 测试使用的块数据：pageIndex + blockIndex + 文本。
+    struct BlockEntry: Sendable {
+        let pageIndex: Int
+        let blockIndex: Int
+        let text: String
+    }
+
+    /// 一次批量请求的去重/回填计划（纯数据，可独立测试）。
+    struct BackfillPlan: Sendable {
+        var items: [BatchTranslationItem] = []
+        var cachedBackfills: [(pageIndex: Int, blockIndex: Int, translation: String)] = []
+        var repIDToRefs: [String: [(pageIndex: Int, blockIndex: Int, text: String)]] = [:]
+        var repIDToText: [String: String] = [:]
+    }
+
+    private func processImagesBatched(
+        imageFiles: [String],
+        extractDir: URL,
+        outputDir: URL,
+        ocrLangs: [String],
+        settings: AppSettings,
+        api: TranslationAPI,
+        progressUpdate: @escaping @Sendable (TaskProgress) -> Void
+    ) async throws -> ProcessingStats {
+        let batchConcurrency = max(1, settings.batchConcurrency)
+        let maxPagesPerBatch = max(1, settings.batchPagesLimit)
+        let requestedImageConcurrency = max(1, settings.taskConcurrency)
+        let imageConcurrency = min(requestedImageConcurrency, max(1, imageFiles.count))
+
+        let config = BatchProcessingConfig(
+            sourceLang: settings.sourceLang,
+            targetLang: settings.targetLang,
+            domainKey: settings.domain.rawValue,
+            batchConcurrency: batchConcurrency,
+            maxPagesPerBatch: maxPagesPerBatch
+        )
+
+        addLog(.info, "   🧠 跨页批量翻译：\(batchConcurrency) 路并发，每批最多 \(maxPagesPerBatch) 页")
+        addLog(.info, "   ⚙️ OCR 处理并发: \(imageConcurrency) | 翻译并发: \(batchConcurrency)")
+
+        let batchLog: BatchLogHandler = { [weak self] level, message in
+            Task { @MainActor [weak self] in
+                self?.addLog(level, message)
+            }
+        }
+
+        let progressReporter = ImageProgressReporter(totalFiles: imageFiles.count, progressUpdate: progressUpdate)
+
+        // 阶段 1：对每页做 OCR / 文本合并，得到 PreparedPage。
+        let prepareStart = CFAbsoluteTimeGetCurrent()
+        batchLog(.info, "   🔍 OCR 阶段开始：共 " + String(imageFiles.count) + " 张图片，页面处理并发 " + String(imageConcurrency))
+        let prepared = try await Self.preparePagesForBatching(
+            imageFiles: imageFiles,
+            extractDir: extractDir,
+            outputDir: outputDir,
+            ocrLangs: ocrLangs,
+            config: config,
+            ocrEngine: ocrEngine,
+            progressReporter: progressReporter,
+            imageConcurrency: imageConcurrency
+        )
+        var stats = prepared.stats
+        let prepareTime = CFAbsoluteTimeGetCurrent() - prepareStart
+        let textBlockCount = prepared.pages.reduce(0) { $0 + $1.mergedBlocks.count }
+        batchLog(.success, "   ✅ OCR 阶段结束：耗时 " + formatElapsed(prepareTime) + "，" + String(prepared.pages.count) + " 页含文本，" + String(textBlockCount) + " 个文本块")
+        addLog(.info, "   🔍 预处理完成：\(prepared.pages.count) 页含文本，\(textBlockCount) 个文本块 | \(stats.skipped) 无文字, \(stats.failed) 失败 [\(formatElapsed(prepareTime))]")
+
+        guard !prepared.pages.isEmpty else {
+            try Task.checkCancellation()
+            return stats
+        }
+
+        // 阶段 2：BatchPlanner 按 N/W/B 自适应分组（W=批量并发，B=每批页数上限）。
+        let pageGroups = BatchPlanner.planPageIndices(
+            pageCount: prepared.pages.count,
+            concurrency: batchConcurrency,
+            maxPagesPerBatch: maxPagesPerBatch
+        )
+        let batchSummary = pageGroups.enumerated().map { (idx, pages) -> String in
+            let actualPages = pages.map { prepared.pages[$0].pageIndex }
+            let range = actualPages.count == 1 ? "\(actualPages[0])" : "\(actualPages.first!)-\(actualPages.last!)"
+            return "批\(idx + 1)[\(pages.count)]页\(range)"
+        }.joined(separator: " ")
+        addLog(.info, "   📦 \(pageGroups.count) 个批次：" + batchSummary)
+        let theoreticalRounds = (pageGroups.count + batchConcurrency - 1) / batchConcurrency
+        addLog(.info, "   🚦 批量请求并发上限：\(batchConcurrency) 路 | 每批最多 \(maxPagesPerBatch) 页 | 理论至少 \(theoreticalRounds) 轮")
+
+        // 阶段 3：按 batch id 调用 api.translateBatch；用信号量限制并发 ≤ W。
+        let semaphore = AsyncSemaphore(value: batchConcurrency)
+        let executionTracker = BatchExecutionTracker()
+        let translationTracker = BatchExecutionTracker()
+        try await withThrowingTaskGroup(of: ProcessingStats.self) { group in
+            for (batchIndex, pageIndices) in pageGroups.enumerated() {
+                let batchID = String(batchIndex + 1)
+                let groupPages = pageIndices.map { prepared.pages[$0] }
+                group.addTask { [extractDir, outputDir, config, api, cache, semaphore, progressReporter, executionTracker, translationTracker, batchLog] in
+                    await semaphore.wait()
+                    if Task.isCancelled {
+                        await semaphore.signal()
+                        throw CancellationError()
+                    }
+                    let active = await executionTracker.begin()
+                    let batchStart = CFAbsoluteTimeGetCurrent()
+                    batchLog(.info, "   ▶️ [批次 " + batchID + "] 开始执行 | " + String(groupPages.count) + " 张图片 | 当前批次任务并发 " + String(active) + "/" + String(batchConcurrency))
+                    do {
+                        let batchStats = try await Self.processBatchGroup(
+                            batchID: batchID,
+                            pages: groupPages,
+                            extractDir: extractDir,
+                            outputDir: outputDir,
+                            config: config,
+                            api: api,
+                            cache: cache,
+                            progressReporter: progressReporter,
+                            batchLog: batchLog,
+                            translationTracker: translationTracker
+                        )
+                        let remaining = await executionTracker.end()
+                        await semaphore.signal()
+                        batchLog(.success, "   ✅ [批次 " + batchID + "] 执行结束 | 耗时 " + String(format: "%.1fs", CFAbsoluteTimeGetCurrent() - batchStart) + " | 当前批次任务并发 " + String(remaining) + "/" + String(batchConcurrency))
+                        return batchStats
+                    } catch {
+                        let remaining = await executionTracker.end()
+                        await semaphore.signal()
+                        if Task.isCancelled || error is CancellationError {
+                            throw CancellationError()
+                        }
+                        batchLog(.error, "   ❌ [批次 " + batchID + "] 执行失败 | 耗时 " + String(format: "%.1fs", CFAbsoluteTimeGetCurrent() - batchStart) + " | 当前批次任务并发 " + String(remaining) + "/" + String(batchConcurrency) + " | " + error.localizedDescription)
+                        throw error
+                    }
+                }
+            }
+            for try await batchStats in group {
+                stats.merge(batchStats)
+            }
+        }
+        try Task.checkCancellation()
+
+        addLog(.info, "   🔁 批次首请求: \(stats.batchRequestCount)（每批首选 1 次 translateBatch；重试/拆分会额外增加） | 回退: \(stats.fallbackCount) | 未翻译文本块: \(stats.untranslatedBlocks) | 翻译耗时: \(formatElapsed(stats.translateTime))")
+        addLog(.info, "   📊 渲染完成：\(stats.translated) 页成功, \(stats.failed) 失败 | 渲染耗时: \(formatElapsed(stats.renderTime))")
+
+        return stats
+    }
+
+    nonisolated private static func preparePagesForBatching(
+        imageFiles: [String],
+        extractDir: URL,
+        outputDir: URL,
+        ocrLangs: [String],
+        config: BatchProcessingConfig,
+        ocrEngine: OCREngine,
+        progressReporter: ImageProgressReporter,
+        imageConcurrency: Int
+    ) async throws -> (pages: [PreparedPage], stats: ProcessingStats) {
+        let imageSemaphore = AsyncSemaphore(value: imageConcurrency)
+        var pageSlots: [PreparedPage?] = Array(repeating: nil, count: imageFiles.count)
+        var stats = ProcessingStats()
+
+        try await withThrowingTaskGroup(of: PrepareResult.self) { group in
+            for (index, relativePath) in imageFiles.enumerated() {
+                group.addTask { [extractDir, outputDir, ocrLangs, ocrEngine, progressReporter, imageSemaphore] in
+                    await imageSemaphore.wait()
+                    do {
+                        let result = try await Self.preparePageForBatching(
+                            index: index,
+                            relativePath: relativePath,
+                            extractDir: extractDir,
+                            outputDir: outputDir,
+                            ocrLangs: ocrLangs,
+                            ocrEngine: ocrEngine,
+                            progressReporter: progressReporter
+                        )
+                        await imageSemaphore.signal()
+                        return result
+                    } catch {
+                        await imageSemaphore.signal()
+                        throw error
+                    }
+                }
+            }
+            for try await result in group {
+                stats.merge(result.stats)
+                if let page = result.page {
+                    pageSlots[page.pageIndex] = page
+                }
+            }
+        }
+
+        return (pageSlots.compactMap { $0 }, stats)
+    }
+
+    /// 对单页做 OCR + 文本合并；无文字/失败时原样复制并计入 skipped/failed。
+    nonisolated private static func preparePageForBatching(
+        index: Int,
+        relativePath: String,
+        extractDir: URL,
+        outputDir: URL,
+        ocrLangs: [String],
+        ocrEngine: OCREngine,
+        progressReporter: ImageProgressReporter
+    ) async throws -> PrepareResult {
+        try Task.checkCancellation()
+        var stats = ProcessingStats()
+        let inputURL = extractDir.appendingPathComponent(relativePath)
+        let outputURL = outputDir.appendingPathComponent(relativePath)
+        try? FileManager.default.createDirectory(at: outputURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+
+        await progressReporter.report(stage: .ocr, index: index, fileName: relativePath, message: "OCR 识别")
+
+        let cgImageOpt: CGImage? = await Task.detached(priority: .userInitiated) {
+            guard let src = CGImageSourceCreateWithURL(inputURL as CFURL, nil),
+                  let img = CGImageSourceCreateImageAtIndex(src, 0, nil) else { return nil }
+            return img
+        }.value
+
+        guard let cgImage = cgImageOpt else {
+            Self.safeCopy(from: inputURL, to: outputURL)
+            stats.failed += 1
+            return PrepareResult(page: nil, stats: stats)
+        }
+
+        let stepStart = CFAbsoluteTimeGetCurrent()
+        let ocrResults: [OCRResult]
+        do {
+            ocrResults = try await ocrEngine.recognize(image: cgImage, languages: ocrLangs)
+        } catch {
+            Self.safeCopy(from: inputURL, to: outputURL)
+            stats.failed += 1
+            return PrepareResult(page: nil, stats: stats)
+        }
+        stats.ocrTime += CFAbsoluteTimeGetCurrent() - stepStart
+
+        let validOCR = ocrResults.filter { $0.boundingBox.width > 0.001 && $0.boundingBox.height > 0.001 }
+        if validOCR.isEmpty {
+            Self.safeCopy(from: inputURL, to: outputURL)
+            stats.skipped += 1
+            return PrepareResult(page: nil, stats: stats)
+        }
+
+        let textBlocks = validOCR.map { TextBlock(from: $0) }
+        let regions = RegionSegmenter().segment(blocks: textBlocks)
+        let textMerger = TextMerger()
+        let mergedBlocks = regions.flatMap { textMerger.merge(blocks: $0.blocks) }
+
+        if mergedBlocks.isEmpty {
+            Self.safeCopy(from: inputURL, to: outputURL)
+            stats.skipped += 1
+            return PrepareResult(page: nil, stats: stats)
+        }
+
+        return PrepareResult(
+            page: PreparedPage(
+                pageIndex: index,
+                relativePath: relativePath,
+                image: SendableImage(image: cgImage),
+                mergedBlocks: mergedBlocks
+            ),
+            stats: stats
+        )
+    }
+
+    nonisolated private static func processBatchGroup(
+        batchID: String,
+        pages: [PreparedPage],
+        extractDir: URL,
+        outputDir: URL,
+        config: BatchProcessingConfig,
+        api: TranslationAPI,
+        cache: TranslationCache,
+        progressReporter: ImageProgressReporter,
+        batchLog: @escaping BatchLogHandler,
+        translationTracker: BatchExecutionTracker
+    ) async throws -> ProcessingStats {
+        try await translateAndRenderGroup(
+            batchID: batchID,
+            pages: pages,
+            extractDir: extractDir,
+            outputDir: outputDir,
+            config: config,
+            api: api,
+            cache: cache,
+            progressReporter: progressReporter,
+            batchLog: batchLog,
+            translationTracker: translationTracker
+        )
+    }
+
+    /// 对一个批次做：去重+缓存 → api.translateBatch（失败重试一次）→ 仍失败拆半 → 单页回退 translateTextsBatch。
+    nonisolated private static func translateAndRenderGroup(
+        batchID: String,
+        pages: [PreparedPage],
+        extractDir: URL,
+        outputDir: URL,
+        config: BatchProcessingConfig,
+        api: TranslationAPI,
+        cache: TranslationCache,
+        progressReporter: ImageProgressReporter,
+        batchLog: @escaping BatchLogHandler,
+        translationTracker: BatchExecutionTracker
+    ) async throws -> ProcessingStats {
+        try Task.checkCancellation()
+
+        let plan = await Self.buildBackfillPlan(pages: pages, config: config, cache: cache)
+        let rawTexts = pages.flatMap { $0.mergedBlocks.map(\.text) }
+        let rawCharacterCount = rawTexts.reduce(0) { $0 + $1.count }
+        let rawByteCount = rawTexts.reduce(0) { $0 + $1.utf8.count }
+        let requestCharacterCount = plan.items.reduce(0) { $0 + $1.text.count }
+        let requestByteCount = plan.items.reduce(0) { $0 + $1.text.utf8.count }
+        batchLog(.info, "   🧾 [批次 " + batchID + "] 数据统计 | 图片 " + String(pages.count) + " 张 | 原始文本块 " + String(rawTexts.count) + " | 原始字符 " + String(rawCharacterCount) + " | 原始 UTF-8 字节 " + String(rawByteCount) + " | 实际发送文本块 " + String(plan.items.count) + " | 实际发送字符 " + String(requestCharacterCount) + " | 实际发送 UTF-8 字节 " + String(requestByteCount) + " | 缓存命中 " + String(plan.cachedBackfills.count))
+
+        // 全部命中缓存：无需请求，直接渲染。
+        if plan.items.isEmpty {
+            batchLog(.info, "   ⏭️ [批次 " + batchID + "] 翻译阶段跳过：全部文本命中缓存")
+            let renderStart = CFAbsoluteTimeGetCurrent()
+            batchLog(.info, "   🎨 [批次 " + batchID + "] 渲染开始 | " + String(pages.count) + " 张图片")
+            let map = Self.buildTranslations(pages: pages, plan: plan, resolved: [:])
+            let renderStats = try await Self.renderPages(
+                pages: pages,
+                translationsByPage: map,
+                extractDir: extractDir,
+                outputDir: outputDir,
+                progressReporter: progressReporter
+            )
+            batchLog(.success, "   ✅ [批次 " + batchID + "] 渲染结束 | 耗时 " + String(format: "%.1fs", CFAbsoluteTimeGetCurrent() - renderStart))
+            return renderStats
+        }
+
+        for page in pages {
+            await progressReporter.report(
+                stage: .translating,
+                index: page.pageIndex,
+                fileName: page.relativePath,
+                message: "翻译 \(page.mergedBlocks.count) 段"
+            )
+        }
+
+        var stats = ProcessingStats()
+        stats.batchRequestCount += 1
+        var resolved: [String: String] = [:]
+        let requestStart = CFAbsoluteTimeGetCurrent()
+        var succeeded = false
+        let apiActive = await translationTracker.begin()
+        batchLog(.info, "   🌐 [批次 " + batchID + "] 翻译 API 开始 | 当前 API 并发 " + String(apiActive) + "/" + String(config.batchConcurrency) + " | 首请求 1 次 | 文本块 " + String(plan.items.count) + " | 字符 " + String(requestCharacterCount))
+
+        do {
+            try Task.checkCancellation()
+            let results = try await Self.requestBatchWithRetry(
+                api: api,
+                items: plan.items,
+                source: config.sourceLang,
+                target: config.targetLang,
+                batchID: batchID,
+                batchLog: batchLog
+            )
+            stats.translateTime += CFAbsoluteTimeGetCurrent() - requestStart
+            for r in results { resolved[r.id] = r.text }
+            succeeded = true
+            let apiRemaining = await translationTracker.end()
+            batchLog(.success, "   ✅ [批次 " + batchID + "] 翻译 API 结束 | 耗时 " + String(format: "%.1fs", CFAbsoluteTimeGetCurrent() - requestStart) + " | 返回 " + String(results.count) + " 项 | 当前 API 并发 " + String(apiRemaining) + "/" + String(config.batchConcurrency))
+        } catch {
+            stats.translateTime += CFAbsoluteTimeGetCurrent() - requestStart
+            let apiRemaining = await translationTracker.end()
+            if Task.isCancelled { throw CancellationError() }
+            batchLog(.error, "   ❌ [批次 " + batchID + "] 翻译 API 结束但未通过校验 | 耗时 " + String(format: "%.1fs", CFAbsoluteTimeGetCurrent() - requestStart) + " | 当前 API 并发 " + String(apiRemaining) + "/" + String(config.batchConcurrency) + " | " + error.localizedDescription + " | 将拆分或回退")
+        }
+
+        if succeeded {
+            // 成功后逐条写入现有 TranslationCache。
+            for item in plan.items {
+                if let t = resolved[item.id], !t.isEmpty {
+                    await cache.set(item.text, config.sourceLang, config.targetLang, t, config.domainKey)
+                }
+            }
+            let map = Self.buildTranslations(pages: pages, plan: plan, resolved: resolved)
+            try Task.checkCancellation()
+            let renderStart = CFAbsoluteTimeGetCurrent()
+            batchLog(.info, "   🎨 [批次 " + batchID + "] 渲染开始 | " + String(pages.count) + " 张图片")
+            let renderStats = try await Self.renderPages(
+                pages: pages,
+                translationsByPage: map,
+                extractDir: extractDir,
+                outputDir: outputDir,
+                progressReporter: progressReporter
+            )
+            batchLog(.success, "   ✅ [批次 " + batchID + "] 渲染结束 | 耗时 " + String(format: "%.1fs", CFAbsoluteTimeGetCurrent() - renderStart) + " | 成功 " + String(renderStats.translated) + " 张 | 失败 " + String(renderStats.failed) + " 张 | 未翻译文本块 " + String(renderStats.untranslatedBlocks))
+            stats.merge(renderStats)
+            return stats
+        } else {
+            // 仍失败：拆半递归；单页则回退到单文本 translateTextsBatch。
+            if pages.count > 1 {
+                batchLog(.warning, "   ✂️ [批次 " + batchID + "] 开始拆分 | 原批次 " + String(pages.count) + " 张图片 | 原因：批量响应不完整或请求失败")
+                let mid = pages.count / 2
+                let left = try await translateAndRenderGroup(
+                    batchID: batchID + ".1",
+                    pages: Array(pages[..<mid]),
+                    extractDir: extractDir,
+                    outputDir: outputDir,
+                    config: config,
+                    api: api,
+                    cache: cache,
+                    progressReporter: progressReporter,
+                    batchLog: batchLog,
+                    translationTracker: translationTracker
+                )
+                let right = try await translateAndRenderGroup(
+                    batchID: batchID + ".2",
+                    pages: Array(pages[mid...]),
+                    extractDir: extractDir,
+                    outputDir: outputDir,
+                    config: config,
+                    api: api,
+                    cache: cache,
+                    progressReporter: progressReporter,
+                    batchLog: batchLog,
+                    translationTracker: translationTracker
+                )
+                var merged = ProcessingStats()
+                merged.merge(left)
+                merged.merge(right)
+                merged.batchRequestCount += stats.batchRequestCount
+                merged.translateTime += stats.translateTime
+                merged.fallbackCount += 1
+                batchLog(.info, "   🔁 [批次 " + batchID + "] 拆分完成 | 子批次已分别处理")
+                return merged
+            } else {
+                stats.fallbackCount += 1
+                batchLog(.warning, "   ↩️ [批次 " + batchID + "] 进入单页回退 | 图片 1 张")
+                let fb = try await Self.fallbackSinglePage(
+                    batchID: batchID,
+                    pages: pages,
+                    extractDir: extractDir,
+                    outputDir: outputDir,
+                    config: config,
+                    api: api,
+                    cache: cache,
+                    progressReporter: progressReporter,
+                    batchLog: batchLog
+                )
+                stats.merge(fb)
+                return stats
+            }
+        }
+    }
+
+    /// 批量请求失败（含 JSON 校验失败）时重试一次。
+    nonisolated static func requestBatchWithRetry(
+        api: TranslationAPI,
+        items: [BatchTranslationItem],
+        source: String,
+        target: String,
+        batchID: String = "",
+        batchLog: BatchLogHandler? = nil
+    ) async throws -> [BatchTranslationResult] {
+        for attempt in 1...2 {
+            let attemptStart = CFAbsoluteTimeGetCurrent()
+            if !batchID.isEmpty {
+                batchLog?(.info, "   ↻ [批次 " + batchID + "] API 第 " + String(attempt) + " 次请求开始")
+            }
+            do {
+                let results = try await api.translateBatch(items, from: source, to: target)
+                if !batchID.isEmpty {
+                    batchLog?(.success, "   ✓ [批次 " + batchID + "] API 第 " + String(attempt) + " 次请求结束 | 耗时 " + String(format: "%.1fs", CFAbsoluteTimeGetCurrent() - attemptStart))
+                }
+                return results
+            } catch {
+                if Task.isCancelled || error is CancellationError {
+                    if !batchID.isEmpty {
+                        batchLog?(.warning, "   ⏹️ [批次 " + batchID + "] API 请求已取消")
+                    }
+                    throw CancellationError()
+                }
+                if !batchID.isEmpty {
+                    batchLog?(.error, "   ⚠️ [批次 " + batchID + "] API 第 " + String(attempt) + " 次请求失败 | 耗时 " + String(format: "%.1fs", CFAbsoluteTimeGetCurrent() - attemptStart) + " | " + error.localizedDescription)
+                }
+                if attempt == 2 { throw error }
+                try await Task.sleep(nanoseconds: 300_000_000)
+            }
+        }
+        throw CancellationError()
+    }
+
+    /// 纯函数：由块列表 + 缓存命中表构建去重/回填计划。可独立测试。
+    nonisolated static func buildBlockPlan(
+        blocks: [BlockEntry],
+        cached: [String: String]
+    ) -> BackfillPlan {
+        var plan = BackfillPlan()
+        var textToRepID: [String: String] = [:]
+        for entry in blocks {
+            let trimmed = entry.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty { continue }
+            if let cachedTranslation = cached[trimmed] {
+                plan.cachedBackfills.append((entry.pageIndex, entry.blockIndex, cachedTranslation))
+            } else if let repID = textToRepID[trimmed] {
+                plan.repIDToRefs[repID]!.append((entry.pageIndex, entry.blockIndex, trimmed))
+            } else {
+                let repID = "p\(entry.pageIndex)_b\(entry.blockIndex)"
+                textToRepID[trimmed] = repID
+                plan.repIDToRefs[repID] = [(entry.pageIndex, entry.blockIndex, trimmed)]
+                plan.repIDToText[repID] = trimmed
+                plan.items.append(BatchTranslationItem(id: repID, text: trimmed))
+            }
+        }
+        return plan
+    }
+
+    nonisolated private static func buildBackfillPlan(
+        pages: [PreparedPage],
+        config: BatchProcessingConfig,
+        cache: TranslationCache
+    ) async -> BackfillPlan {
+        var entries: [BlockEntry] = []
+        var uniqueTexts: [String] = []
+        var seen = Set<String>()
+        for page in pages {
+            for (blockIndex, block) in page.mergedBlocks.enumerated() {
+                let trimmed = block.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if trimmed.isEmpty { continue }
+                entries.append(BlockEntry(pageIndex: page.pageIndex, blockIndex: blockIndex, text: block.text))
+                if !seen.contains(trimmed) {
+                    seen.insert(trimmed)
+                    uniqueTexts.append(trimmed)
+                }
+            }
+        }
+        var cached: [String: String] = [:]
+        for text in uniqueTexts {
+            if let c = await cache.get(text, config.sourceLang, config.targetLang, config.domainKey) {
+                cached[text] = c
+            }
+        }
+        return Self.buildBlockPlan(blocks: entries, cached: cached)
+    }
+
+    nonisolated private static func buildTranslations(
+        pages: [PreparedPage],
+        plan: BackfillPlan,
+        resolved: [String: String]
+    ) -> [Int: [String]] {
+        var map: [Int: [String]] = [:]
+        for page in pages {
+            map[page.pageIndex] = Array(repeating: "", count: page.mergedBlocks.count)
+        }
+        for (pageIndex, blockIndex, translation) in plan.cachedBackfills {
+            map[pageIndex]?[blockIndex] = translation
+        }
+        for (repID, refs) in plan.repIDToRefs {
+            let translation = resolved[repID] ?? ""
+            for (pageIndex, blockIndex, _) in refs {
+                map[pageIndex]?[blockIndex] = translation
+            }
+        }
+        return map
+    }
+
+    nonisolated private static func renderPages(
+        pages: [PreparedPage],
+        translationsByPage: [Int: [String]],
+        extractDir: URL,
+        outputDir: URL,
+        progressReporter: ImageProgressReporter
+    ) async throws -> ProcessingStats {
+        var stats = ProcessingStats()
+        for page in pages {
+            try Task.checkCancellation()
+            let translations = translationsByPage[page.pageIndex] ?? []
+            let missingCount = page.mergedBlocks.indices.reduce(0) { count, index in
+                count + (index >= translations.count || translations[index].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? 1 : 0)
+            }
+            stats.untranslatedBlocks += missingCount
+            await progressReporter.report(stage: .rendering, index: page.pageIndex, fileName: page.relativePath, message: "渲染")
+            let renderStart = CFAbsoluteTimeGetCurrent()
+            let ok = await Self.renderPage(
+                page: page,
+                outputDir: outputDir,
+                translations: translations
+            )
+            stats.renderTime += CFAbsoluteTimeGetCurrent() - renderStart
+            if ok {
+                stats.translated += 1
+            } else {
+                Self.safeCopy(
+                    from: extractDir.appendingPathComponent(page.relativePath),
+                    to: outputDir.appendingPathComponent(page.relativePath)
+                )
+                stats.failed += 1
+            }
+        }
+        return stats
+    }
+
+    nonisolated private static func renderPage(
+        page: PreparedPage,
+        outputDir: URL,
+        translations: [String]
+    ) async -> Bool {
+        let outputURL = outputDir.appendingPathComponent(page.relativePath)
+        try? FileManager.default.createDirectory(at: outputURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        return await Task.detached(priority: .userInitiated) {
+            guard let rendered = ImageRenderer.renderTranslated(
+                original: page.image.image,
+                textBlocks: page.mergedBlocks,
+                translations: translations
+            ) else { return false }
+            let imgFormat = ImageRenderer.imageFormat(for: outputURL)
+            do {
+                try ImageRenderer.saveImage(rendered, to: outputURL, format: imgFormat)
+                return true
+            } catch {
+                return false
+            }
+        }.value
+    }
+
+    /// 单页批量彻底失败后的回退：退化为现有单文本 translateTextsBatch。
+    nonisolated private static func fallbackSinglePage(
+        batchID: String,
+        pages: [PreparedPage],
+        extractDir: URL,
+        outputDir: URL,
+        config: BatchProcessingConfig,
+        api: TranslationAPI,
+        cache: TranslationCache,
+        progressReporter: ImageProgressReporter,
+        batchLog: @escaping BatchLogHandler
+    ) async throws -> ProcessingStats {
+        var stats = ProcessingStats()
+        for page in pages {
+            try Task.checkCancellation()
+            let texts = page.mergedBlocks.map(\.text)
+            let concurrency = max(1, min(config.batchConcurrency, texts.count))
+            let translateStart = CFAbsoluteTimeGetCurrent()
+            var translations = await translateTextsBatch(
+                texts: texts,
+                from: config.sourceLang,
+                to: config.targetLang,
+                api: api,
+                cache: cache,
+                concurrency: concurrency,
+                domainKey: config.domainKey
+            )
+            stats.translateTime += CFAbsoluteTimeGetCurrent() - translateStart
+
+            // 单页回退后仍为空的文本块，再用单项结构化批量请求补偿一次，避免静默漏翻译。
+            let unresolved = texts.indices.filter { translations[$0].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            if !unresolved.isEmpty {
+                batchLog(.warning, "   🔧 [批次 " + batchID + "] 单页回退后仍有 " + String(unresolved.count) + " 个未翻译文本块，开始逐块补偿")
+            }
+            for index in texts.indices where translations[index].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                try Task.checkCancellation()
+                let item = BatchTranslationItem(id: "p\(page.pageIndex)_b\(index)", text: texts[index].trimmingCharacters(in: .whitespacesAndNewlines))
+                guard !item.text.isEmpty else { continue }
+                let retryStart = CFAbsoluteTimeGetCurrent()
+                if let result = try? await Self.requestBatchWithRetry(
+                    api: api,
+                    items: [item],
+                    source: config.sourceLang,
+                    target: config.targetLang,
+                    batchID: batchID + ".b" + String(index),
+                    batchLog: batchLog
+                ), let recovered = result.first?.text {
+                    let cleanedRecovered = recovered.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+                    if !cleanedRecovered.isEmpty {
+                        translations[index] = recovered
+                        await cache.set(item.text, config.sourceLang, config.targetLang, recovered, config.domainKey)
+                        batchLog(.success, "   ✅ [批次 " + batchID + "] 文本块 b" + String(index) + " 补偿成功")
+                    } else {
+                        batchLog(.error, "   ❌ [批次 " + batchID + "] 文本块 b" + String(index) + " 补偿失败，将保留原文")
+                    }
+                } else {
+                    batchLog(.error, "   ❌ [批次 " + batchID + "] 文本块 b" + String(index) + " 补偿失败，将保留原文")
+                }
+                stats.batchRequestCount += 1
+                stats.translateTime += CFAbsoluteTimeGetCurrent() - retryStart
+            }
+            try Task.checkCancellation()
+            let renderStats = try await Self.renderPages(
+                pages: [page],
+                translationsByPage: [page.pageIndex: translations],
+                extractDir: extractDir,
+                outputDir: outputDir,
+                progressReporter: progressReporter
+            )
+            stats.merge(renderStats)
+        }
         return stats
     }
 

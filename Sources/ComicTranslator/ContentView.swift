@@ -608,35 +608,61 @@ struct ContentView: View {
         DisclosureGroup {
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
-                    Text("并发数")
-                        .frame(width: 80, alignment: .trailing)
+                    Text("OCR 处理并发")
+                        .frame(width: 112, alignment: .trailing)
                         .foregroundStyle(.secondary)
-                    Stepper(value: $settings.concurrency, in: 1...16) {
-                        Text("\(settings.concurrency) 路并行")
+                    Stepper(value: $settings.taskConcurrency, in: 1...16) {
+                        Text("\(settings.taskConcurrency) 路并行")
                             .font(.callout.monospacedDigit())
                     }
                     .disabled(translator.isProcessing)
-                    .onChange(of: settings.concurrency) { _, _ in
-                        normalizeTaskConcurrency()
-                    }
                 }
+                Text("控制 PDF 拆页、OCR 等页面级处理的同时任务数。")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.leading, 116)
 
                 HStack {
-                    Text("页面并发")
-                        .frame(width: 80, alignment: .trailing)
+                    Text("翻译并发")
+                        .frame(width: 112, alignment: .trailing)
                         .foregroundStyle(.secondary)
-                    Picker("", selection: $settings.taskConcurrency) {
-                        ForEach(taskConcurrencyOptions, id: \.self) { value in
-                            Text("\(value) 路").tag(value)
-                        }
+                    Stepper(value: $settings.batchConcurrency, in: 1...16) {
+                        Text("\(settings.batchConcurrency) 路并行")
+                            .font(.callout.monospacedDigit())
                     }
-                    .labelsHidden()
                     .disabled(translator.isProcessing)
+                }
+                Text("图片批量模式下控制同时发送的批次数；音视频字幕等兼容流程下控制并行 API 请求数。")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.leading, 116)
+
+                HStack {
+                    Text("单批次最大页数")
+                        .frame(width: 112, alignment: .trailing)
+                        .foregroundStyle(.secondary)
+                    Stepper(value: $settings.batchPagesLimit, in: 1...8) {
+                        Text("\(settings.batchPagesLimit) 页/批")
+                            .font(.callout.monospacedDigit())
+                    }
+                    .disabled(translator.isProcessing)
+                }
+
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: "info.circle")
+                        .foregroundStyle(.blue)
+                        .font(.caption2)
+                    Text(batchRuleDescription)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
 
                 HStack {
                     Text("温度")
-                        .frame(width: 80, alignment: .trailing)
+                        .frame(width: 112, alignment: .trailing)
                         .foregroundStyle(.secondary)
                     Slider(value: $settings.temperature, in: 0...1, step: 0.1)
                     Text(String(format: "%.1f", settings.temperature))
@@ -655,7 +681,7 @@ struct ContentView: View {
                             RoundedRectangle(cornerRadius: 4)
                                 .stroke(Color.secondary.opacity(0.3), lineWidth: 1)
                         )
-                    Text("变量: {text} {source} {target} {domain}")
+                    Text("变量: {text} {items} {batch} {source} {target} {domain}")
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
                 }
@@ -668,16 +694,11 @@ struct ContentView: View {
         .padding(.horizontal, 4)
     }
 
-    private var taskConcurrencyOptions: [Int] {
-        let maxValue = max(1, min(settings.concurrency, 8))
-        let options = (1...maxValue).filter { settings.concurrency % $0 == 0 }
-        return options.isEmpty ? [1] : options
-    }
-
-    private func normalizeTaskConcurrency() {
-        let options = taskConcurrencyOptions
-        guard !options.contains(settings.taskConcurrency) else { return }
-        settings.taskConcurrency = options.reversed().first { $0 <= settings.taskConcurrency } ?? 1
+    /// 跨页分批说明：表达 N 页、W 路时的自适应均匀分批规则。
+    private var batchRuleDescription: String {
+        let pages = settings.batchPagesLimit
+        let ways = settings.batchConcurrency
+        return "按页数均匀分批，每批最多 \(pages) 页，同时最多发送 \(ways) 个批次；页数不足时也会拆成更小的批次。"
     }
 
     // MARK: - 日志

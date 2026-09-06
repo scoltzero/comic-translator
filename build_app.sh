@@ -24,6 +24,12 @@ EXECUTABLE="$BUILD_DIR/$APP_NAME"
 if [ ! -f "$EXECUTABLE" ]; then
     EXECUTABLE=".build/apple/Products/Release/$APP_NAME"
 fi
+# If the local Xcode toolchain cannot produce a Release build, use the
+# already-built arm64 debug executable so the app bundle can still be restored.
+if [ ! -f "$EXECUTABLE" ] && [ -f ".build/arm64-apple-macosx/debug/$APP_NAME" ]; then
+    EXECUTABLE=".build/arm64-apple-macosx/debug/$APP_NAME"
+    echo "⚠️ Release 构建不可用，使用现有 arm64 调试可执行文件打包"
+fi
 if [ ! -f "$EXECUTABLE" ]; then
     echo "❌ 找不到可执行文件"
     ls -la .build/
